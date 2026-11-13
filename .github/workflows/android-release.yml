@@ -1,0 +1,256 @@
+name: Publish Android bootstrapper
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag android-v<versionCode> at the selected default-branch commit
+        required: true
+        type: string
+      version_name:
+        description: Display version embedded in the APK
+        required: true
+        type: string
+      minimum_version_code:
+        description: Lowest APK version allowed into the world (blank requires this release)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neosteam-android-publication
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+  RELEASE_VERSION_NAME: ${{ inputs.version_name }}
+  RELEASE_MINIMUM_CODE: ${{ inputs.minimum_version_code }}
+  RELEASE_BASE_URL: ${{ vars.NEOSTEAM_RELEASE_BASE_URL }}
+  OTA_MANIFEST_URL: ${{ vars.NEOSTEAM_OTA_MANIFEST_URL }}
+  RELEASE_SIGNER_SHA256: ${{ vars.NEOSTEAM_SIGNER_SHA256 }}
+
+jobs:
+  release:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: windows-2025
+    environment: android-release
+    permissions:
+      contents: write
+      pages: read
+    outputs:
+      tag: ${{ steps.prepare.outputs.tag }}
+      manifest_sha256: ${{ steps.publish.outputs.manifest_sha256 }}
+      apk_sha256: ${{ steps.publish.outputs.apk_sha256 }}
+      apk_bytes: ${{ steps.publish.outputs.apk_bytes }}
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check release inputs and publication order
+        id: prepare
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_SERVER_URL -ne 'https://github.com') { throw 'This workflow publishes to github.com.' }
+          if ($env:RELEASE_TAG -cnotmatch '^android-v([1-9][0-9]{0,9})$') { throw 'Invalid Android release tag.' }
+          $version = [long]$Matches[1]
+          if ($version -gt 2100000000) { throw 'Android version code is out of range.' }
+          if ($env:RELEASE_VERSION_NAME -cnotmatch '^[0-9A-Za-z][0-9A-Za-z._+\-]{0,63}$') { throw 'Invalid version name.' }
+          $minimum = $version
+          if ($env:RELEASE_MINIMUM_CODE) {
+            if ($env:RELEASE_MINIMUM_CODE -cnotmatch '^[1-9][0-9]{0,9}$') { throw 'Invalid minimum version code.' }
+            $minimum = [long]$env:RELEASE_MINIMUM_CODE
+            if ($minimum -gt $version) { throw 'Minimum version code exceeds the release version.' }
+          }
+          if (($env:RELEASE_SIGNER_SHA256 -replace ':') -cnotmatch '^[0-9a-fA-F]{64}$') { throw 'Set NEOSTEAM_SIGNER_SHA256.' }
+          foreach ($value in @($env:RELEASE_BASE_URL, $env:OTA_MANIFEST_URL)) {
+            $uri = $null
+            if (![Uri]::TryCreate($value, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -cne 'https' -or
+                !$uri.Host -or $uri.UserInfo -or $value -match '[?#\s\\]') {
+              throw 'Set NEOSTEAM_RELEASE_BASE_URL and NEOSTEAM_OTA_MANIFEST_URL to direct HTTPS URLs.'
+            }
+          }
+          $repo = "repos/$env:GITHUB_REPOSITORY"
+          $visibility = gh api "$repo" --jq '.visibility'
+          if ($LASTEXITCODE -ne 0 -or $visibility -cne 'public') { throw 'Use a public distribution repository.' }
+          $pagesBase = gh api "$repo/pages" --jq 'select(.public and .build_type == "workflow") | .html_url'
+          if ($LASTEXITCODE -ne 0 -or !$pagesBase -or $pagesBase.TrimEnd('/') -cne $env:RELEASE_BASE_URL.TrimEnd('/')) {
+            throw 'Enable public GitHub Actions Pages and set NEOSTEAM_RELEASE_BASE_URL to its exact HTTPS base.'
+          }
+          $remoteSha = gh api "$repo/commits/$env:RELEASE_TAG" --jq '.sha'
+          if ($LASTEXITCODE -ne 0 -or $remoteSha -cne $env:GITHUB_SHA) { throw 'Tag must point to the selected workflow commit.' }
+          $rows = gh api "$repo/releases?per_page=100" --paginate --jq '.[] | [.tag_name, .draft, .prerelease] | @tsv'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify release inventory.' }
+          foreach ($row in $rows) {
+            $tag, $draft, $prerelease = $row -split "`t"
+            if ($tag -ceq $env:RELEASE_TAG) { throw 'Release already exists. Preserve published assets and resolve any draft before retrying.' }
+            if ($draft -eq 'false' -and $prerelease -eq 'false' -and $tag -cmatch '^android-v([1-9][0-9]{0,9})$' -and [long]$Matches[1] -ge $version) {
+              throw 'The version code must increase for each public Android release.'
+            }
+          }
+          "tag=$env:RELEASE_TAG" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "minimum=$minimum" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install the pinned Android SDK packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdkManager = Join-Path $env:ANDROID_HOME 'cmdline-tools\latest\bin\sdkmanager.bat'
+          & $sdkManager --install 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+          if ($LASTEXITCODE -ne 0) { throw 'Android SDK installation failed.' }
+
+      - name: Build signed APK and stage release files
+        shell: pwsh
+        env:
+          RELEASE_VERSION_CODE: ${{ steps.prepare.outputs.version }}
+          RELEASE_MINIMUM: ${{ steps.prepare.outputs.minimum }}
+          KEYSTORE_BASE64: ${{ secrets.NEOSTEAM_KEYSTORE_BASE64 }}
+          NEOSTEAM_STORE_PASSWORD: ${{ secrets.NEOSTEAM_STORE_PASSWORD }}
+          NEOSTEAM_KEY_ALIAS: ${{ secrets.NEOSTEAM_KEY_ALIAS }}
+          NEOSTEAM_KEY_PASSWORD: ${{ secrets.NEOSTEAM_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $keystore = Join-Path $env:RUNNER_TEMP ("neosteam-" + [Guid]::NewGuid() + ".keystore")
+          $build = Join-Path $env:RUNNER_TEMP 'neosteam-build'
+          $stage = Join-Path $env:RUNNER_TEMP 'neosteam-distribution'
+          try {
+            $keyBytes = [Convert]::FromBase64String($env:KEYSTORE_BASE64)
+            Remove-Item Env:KEYSTORE_BASE64
+            if ($keyBytes.Length -eq 0) { throw 'Release keystore is unavailable.' }
+            [IO.File]::WriteAllBytes($keystore, $keyBytes)
+            $env:NEOSTEAM_KEYSTORE = $keystore
+            $env:ORG_GRADLE_PROJECT_neosteamVersionCode = $env:RELEASE_VERSION_CODE
+            $env:ORG_GRADLE_PROJECT_neosteamVersionName = $env:RELEASE_VERSION_NAME
+            $env:ORG_GRADLE_PROJECT_neosteamReleaseManifestUrl = $env:RELEASE_BASE_URL.TrimEnd('/') + '/latest.json'
+            & ./android_client/tools/build_release.ps1 -BuildDirectory $build -ManifestUrl $env:OTA_MANIFEST_URL
+          } finally {
+            if (Test-Path -LiteralPath $keystore) { Remove-Item -LiteralPath $keystore }
+            foreach ($name in 'NEOSTEAM_KEYSTORE', 'NEOSTEAM_STORE_PASSWORD', 'NEOSTEAM_KEY_ALIAS', 'NEOSTEAM_KEY_PASSWORD') {
+              [Environment]::SetEnvironmentVariable($name, $null)
+            }
+          }
+          $apk = Join-Path $build 'outputs\apk\release\app-release.apk'
+          python -B tools/release_pipeline/stage_release.py --apk $apk --repo $env:GITHUB_REPOSITORY --tag $env:RELEASE_TAG --version-name $env:RELEASE_VERSION_NAME --minimum-version-code $env:RELEASE_MINIMUM --signer-sha256 $env:RELEASE_SIGNER_SHA256 --output $stage
+          if ($LASTEXITCODE -ne 0) { throw 'Release staging failed.' }
+
+      - name: Upload launcher site artifact
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        with:
+          path: ${{ runner.temp }}/neosteam-distribution/website
+          retention-days: 7
+
+      - name: Publish checked release assets
+        id: publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = "repos/$env:GITHUB_REPOSITORY"
+          $remoteSha = gh api "$repo/commits/$env:RELEASE_TAG" --jq '.sha'
+          if ($LASTEXITCODE -ne 0 -or $remoteSha -cne $env:GITHUB_SHA) { throw 'Tag changed after the build.' }
+          $assets = @(Get-ChildItem (Join-Path $env:RUNNER_TEMP 'neosteam-distribution/github') -File)
+          if ($assets.Count -ne 3) { throw 'Expected APK, checksum and release metadata.' }
+          $paths = @($assets | ForEach-Object FullName)
+          gh release create $env:RELEASE_TAG @paths --repo $env:GITHUB_REPOSITORY --verify-tag --draft --title "NeoSteam Android $env:RELEASE_VERSION_NAME" --notes 'Signed ARM64 bootstrapper. Verify the APK with the attached SHA-256 checksum.'
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed.' }
+          $rows = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json databaseId,isDraft | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or !$rows.isDraft) { throw 'Could not verify release draft.' }
+          $releaseId = $rows.databaseId
+          $remoteJson = gh api "$repo/releases/$releaseId/assets?per_page=100"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not verify uploaded release assets.' }
+          $remote = @($remoteJson | ConvertFrom-Json)
+          if ($remote.Count -ne $assets.Count) { throw 'Unexpected asset inventory in release draft.' }
+          foreach ($asset in $assets) {
+            $entry = $remote | Where-Object name -CEQ $asset.Name
+            $digest = 'sha256:' + (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if (!$entry -or $entry.state -ne 'uploaded' -or $entry.size -ne $asset.Length -or $entry.digest -cne $digest) {
+              throw "Release asset verification failed for $($asset.Name)."
+            }
+          }
+          gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }
+          $manifestAsset = $assets | Where-Object Name -CEQ 'latest.json'
+          $apkAsset = $assets | Where-Object Extension -CEQ '.apk'
+          "manifest_sha256=$((Get-FileHash -LiteralPath $manifestAsset.FullName -Algorithm SHA256).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "apk_sha256=$((Get-FileHash -LiteralPath $apkAsset.FullName -Algorithm SHA256).Hash.ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "apk_bytes=$($apkAsset.Length)" >> $env:GITHUB_OUTPUT
+
+  website:
+    needs: release
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: Check for a newer Android release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tags=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+          newest=$(printf '%s\n' "$tags" | awk '/^android-v[1-9][0-9]*$/ {print substr($0, 10)}' | sort -n | tail -1)
+          if [ "$DEPLOY_TAG" != "android-v$newest" ]; then
+            echo 'A different Android release is current. Do not deploy this launcher artifact.' >&2
+            exit 1
+          fi
+      - name: Publish launcher and latest manifest
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+      - name: Verify public downloads and latest metadata
+        shell: bash
+        env:
+          DEPLOY_TAG: ${{ needs.release.outputs.tag }}
+          EXPECTED_MANIFEST: ${{ needs.release.outputs.manifest_sha256 }}
+          EXPECTED_APK: ${{ needs.release.outputs.apk_sha256 }}
+          EXPECTED_BYTES: ${{ needs.release.outputs.apk_bytes }}
+        run: |
+          set -euo pipefail
+          base=${RELEASE_BASE_URL%/}
+          version=${DEPLOY_TAG#android-v}
+          apk="NeoSteam-android-${version}-arm64.apk"
+          artifact="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$DEPLOY_TAG/$apk"
+          stage=$(mktemp -d)
+          cd "$stage"
+          printf '%s  %s\n' "$EXPECTED_APK" "$apk" > expected.sha256
+          # The app expects a direct manifest response. APK downloads can follow HTTPS redirects.
+          for attempt in $(seq 1 12); do
+            manifest_status=$(curl --silent --show-error --max-time 15 -H 'Cache-Control: no-cache' -o latest.json -w '%{http_code}' "$base/latest.json" || true)
+            checksum_status=$(curl --silent --show-error --max-time 15 -H 'Cache-Control: no-cache' -o latest.apk.sha256 -w '%{http_code}' "$base/latest.apk.sha256" || true)
+            if [ "$manifest_status" = 200 ] && [ "$checksum_status" = 200 ] &&
+              printf '%s  %s\n' "$EXPECTED_MANIFEST" latest.json | sha256sum --check --status &&
+              cmp -s expected.sha256 latest.apk.sha256; then
+              break
+            fi
+            if [ "$attempt" = 12 ]; then
+              echo 'The configured public launcher base did not serve the staged metadata.' >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          curl --fail --silent --show-error --max-time 30 "$base/" -o index.html
+          grep -Fq "$artifact" index.html
+          curl --fail --silent --show-error --location --proto-redir '=https' --max-time 30 "$artifact.sha256" -o tagged.sha256
+          cmp expected.sha256 tagged.sha256
+          curl --fail --silent --show-error --location --proto-redir '=https' --max-time 180 "$artifact" -o "$apk"
+          [ "$(wc -c < "$apk")" -eq "$EXPECTED_BYTES" ]
+          sha256sum --check tagged.sha256

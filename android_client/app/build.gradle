@@ -1,0 +1,244 @@
+import groovy.json.JsonOutput
+import java.nio.file.Files
+import javax.inject.Inject
+import org.gradle.process.ExecOperations
+
+plugins {
+    id "com.android.application" version "9.2.1"
+}
+
+def appBuildDirectory = providers.gradleProperty("neosteamBuildDir")
+if (appBuildDirectory.isPresent()) {
+    layout.buildDirectory.set(rootProject.file(appBuildDirectory.get()))
+}
+
+def otaUrl = providers.gradleProperty("neosteamOtaManifestUrl").orElse("").get()
+def otaUri = null
+if (!otaUrl.isEmpty()) {
+    try {
+        otaUri = new URI(otaUrl)
+    } catch (URISyntaxException ignored) {
+        throw new GradleException("The OTA manifest URL is invalid.")
+    }
+    def loopback = otaUri.host in ["127.0.0.1", "localhost", "[::1]"]
+    if (!otaUri.host || otaUri.userInfo != null || otaUri.query != null || otaUri.fragment != null ||
+            (otaUri.scheme != "https" && !(otaUri.scheme == "http" && loopback))) {
+        throw new GradleException("The OTA manifest URL must use HTTPS and omit credentials, query strings, and fragments. Debug builds also accept local HTTP test endpoints.")
+    }
+    otaUrl = otaUri.toASCIIString()
+}
+def releaseOtaUrl = otaUri?.scheme == "https" ? otaUrl : ""
+
+def releaseManifestUrl = providers.gradleProperty("neosteamReleaseManifestUrl").orElse("").get()
+def releaseManifestUri = null
+if (!releaseManifestUrl.isEmpty()) {
+    try {
+        releaseManifestUri = new URI(releaseManifestUrl)
+    } catch (URISyntaxException ignored) {
+        throw new GradleException("The release manifest URL is invalid.")
+    }
+    def loopback = releaseManifestUri.host?.toLowerCase(Locale.ROOT) in ["127.0.0.1", "localhost", "[::1]"]
+    if (!releaseManifestUri.host || !releaseManifestUri.path || releaseManifestUri.path == "/" ||
+            releaseManifestUri.port == 0 || releaseManifestUri.port > 65535 ||
+            releaseManifestUri.userInfo != null || releaseManifestUri.query != null || releaseManifestUri.fragment != null ||
+            !(releaseManifestUri.scheme == "https" || (releaseManifestUri.scheme == "http" && loopback))) {
+        throw new GradleException("Use a direct HTTPS release manifest URL. Debug builds also accept loopback HTTP.")
+    }
+    releaseManifestUrl = releaseManifestUri.toASCIIString()
+}
+
+def requestedVersionCode = providers.gradleProperty("neosteamVersionCode").orElse("1").get()
+def requestedVersionName = providers.gradleProperty("neosteamVersionName").orElse("0.1.0").get()
+if (!(requestedVersionCode ==~ /[1-9][0-9]{0,9}/) || requestedVersionCode.toLong() > 2100000000) {
+    throw new GradleException("neosteamVersionCode must be an integer from 1 through 2100000000.")
+}
+if (!(requestedVersionName ==~ /[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}/)) {
+    throw new GradleException("neosteamVersionName must be 1 to 64 characters using letters, numbers, dots, plus, underscore or hyphen.")
+}
+
+def diagnosticsUrl = providers.gradleProperty("neosteamDiagnosticsUrl").orElse("").get()
+if (!diagnosticsUrl.isEmpty()) {
+    try {
+        def endpoint = new URI(diagnosticsUrl)
+        def loopback = endpoint.host?.toLowerCase(Locale.ROOT) in ["127.0.0.1", "localhost", "[::1]"]
+        if (!endpoint.host || endpoint.userInfo != null || endpoint.query != null || endpoint.fragment != null ||
+                !(endpoint.scheme == "https" || (endpoint.scheme == "http" && loopback))) {
+            throw new GradleException("The debug diagnostics URL must use HTTPS or loopback HTTP and omit credentials, query strings, and fragments.")
+        }
+        diagnosticsUrl = endpoint.toASCIIString()
+    } catch (URISyntaxException ignored) {
+        throw new GradleException("The debug diagnostics URL is invalid.")
+    }
+}
+
+def signingFields = ["NEOSTEAM_KEYSTORE", "NEOSTEAM_STORE_PASSWORD",
+    "NEOSTEAM_KEY_ALIAS", "NEOSTEAM_KEY_PASSWORD"]
+def signingInputs = signingFields.collectEntries { name -> [name, providers.environmentVariable(name).orNull] }
+def missingSigningInputs = signingFields.findAll { name -> !signingInputs[name] }
+def signedReleaseRequired = providers.gradleProperty("neosteamRequireReleaseSigning")
+    .map { it.toBoolean() }.orElse(false).get()
+def signingStore = signingInputs.NEOSTEAM_KEYSTORE
+    ? rootProject.file(signingInputs.NEOSTEAM_KEYSTORE) : null
+
+android {
+    namespace = "org.neosteam.revival"
+    compileSdk = 36
+    ndkVersion = "28.2.13676358"
+
+    defaultConfig {
+        applicationId = "org.neosteam.revival"
+        minSdk = 24
+        targetSdk = 36
+        versionCode = requestedVersionCode.toInteger()
+        versionName = requestedVersionName
+        buildConfigField("String", "RELEASE_MANIFEST_URL", JsonOutput.toJson(releaseManifestUrl))
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = rootProject.file("CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    signingConfigs {
+        if (missingSigningInputs.isEmpty()) {
+            release {
+                storeFile = signingStore
+                storePassword = signingInputs.NEOSTEAM_STORE_PASSWORD
+                keyAlias = signingInputs.NEOSTEAM_KEY_ALIAS
+                keyPassword = signingInputs.NEOSTEAM_KEY_PASSWORD
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            buildConfigField("String", "OTA_MANIFEST_URL", JsonOutput.toJson(otaUrl))
+            buildConfigField("String", "DIAGNOSTICS_URL", JsonOutput.toJson(diagnosticsUrl))
+            externalNativeBuild {
+                cmake {
+                    arguments "-DNEOSTEAM_DEBUG_DIAGNOSTICS=ON"
+                }
+            }
+        }
+        release {
+            buildConfigField("String", "OTA_MANIFEST_URL", JsonOutput.toJson(releaseOtaUrl))
+            externalNativeBuild {
+                cmake {
+                    arguments "-DNEOSTEAM_DEBUG_DIAGNOSTICS=OFF"
+                }
+            }
+            minifyEnabled = true
+            shrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (missingSigningInputs.isEmpty()) signingConfig = signingConfigs.release
+        }
+    }
+
+    sourceSets.main.assets.srcDir(rootProject.file("native/notices"))
+
+    androidResources {
+        noCompress += ["glb", "ktx2", "astc", "ogg"]
+    }
+}
+
+tasks.register("validateNeoSteamReleaseInputs") {
+    doLast {
+        if (otaUri?.scheme == "http") {
+            throw new GradleException("A release OTA manifest URL must use HTTPS.")
+        }
+        if (releaseManifestUri?.scheme == "http") {
+            throw new GradleException("A release version manifest URL must use HTTPS.")
+        }
+        if (signedReleaseRequired || missingSigningInputs.size() != signingFields.size()) {
+            if (!missingSigningInputs.isEmpty()) {
+                throw new GradleException("Release signing requires: " + missingSigningInputs.join(", "))
+            }
+            if (!signingStore.isFile()) throw new GradleException("The release keystore file is unavailable.")
+        }
+    }
+}
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    dependsOn("validateNeoSteamReleaseInputs")
+}
+
+abstract class StageNeoSteamAssets extends DefaultTask {
+    @InputDirectory
+    @Optional
+    @PathSensitive(PathSensitivity.RELATIVE)
+    abstract DirectoryProperty getRunDirectory()
+
+    @InputDirectory
+    @Optional
+    @PathSensitive(PathSensitivity.RELATIVE)
+    abstract DirectoryProperty getAtlasDirectory()
+
+    @InputFile
+    @PathSensitive(PathSensitivity.NONE)
+    abstract RegularFileProperty getStageScript()
+
+    @Input
+    abstract Property<String> getPythonExecutable()
+
+    @OutputDirectory
+    abstract DirectoryProperty getAssetDirectory()
+
+    @Inject
+    abstract ExecOperations getExecOperations()
+
+    @Inject
+    abstract FileSystemOperations getFileSystemOperations()
+
+    @TaskAction
+    void stage() {
+        File staging = Files.createTempDirectory(temporaryDir.toPath(), "stage-").toFile()
+        File stagedAssets = new File(staging, "assets")
+        try {
+            execOperations.exec {
+                def arguments = [pythonExecutable.get(), "-B", stageScript.get().asFile, "--output", stagedAssets]
+                if (runDirectory.isPresent()) arguments += ["--run", runDirectory.get().asFile]
+                if (atlasDirectory.isPresent()) arguments += ["--atlas-run", atlasDirectory.get().asFile]
+                commandLine arguments
+            }
+            fileSystemOperations.sync {
+                from(stagedAssets)
+                into(assetDirectory.get().asFile)
+            }
+        } finally {
+            fileSystemOperations.delete {
+                delete(staging)
+            }
+        }
+    }
+}
+
+def assetRun = providers.gradleProperty("neosteamAssetRun")
+def atlasRun = providers.gradleProperty("neosteamAtlasRun")
+if (assetRun.isPresent() || atlasRun.isPresent()) {
+    def script = rootProject.file("tools/stage_assets.py")
+    def python = providers.gradleProperty("neosteamPython").orElse("python")
+    androidComponents.onVariants(androidComponents.selector().all()) { variant ->
+        def stage = tasks.register("stage${variant.name.capitalize()}NeoSteamAssets", StageNeoSteamAssets) {
+            if (assetRun.isPresent()) it.runDirectory.set(rootProject.file(assetRun.get()))
+            if (atlasRun.isPresent()) it.atlasDirectory.set(rootProject.file(atlasRun.get()))
+            it.stageScript.set(script)
+            it.pythonExecutable.set(python)
+            it.assetDirectory.set(layout.buildDirectory.dir("generated/neosteam-assets/${variant.name}"))
+        }
+        variant.sources.assets.addGeneratedSourceDirectory(stage) { it.assetDirectory }
+    }
+}
